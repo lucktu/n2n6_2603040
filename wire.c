@@ -299,10 +299,14 @@ size_t encode_REGISTER_SUPER( uint8_t * base,
     retval += encode_mac( base, idx, reg->edgeMac );
     retval += encode_uint32( base, idx, reg->dev_addr.net_addr );
     retval += encode_uint8( base, idx, reg->dev_addr.net_bitlen );
-    retval += encode_uint8( base, idx, 0 ); /* num_local_socks = 0 */
-    retval += encode_uint16( base, idx, 0 ); /* NULL auth scheme */
-    retval += encode_uint16( base, idx, 0 ); /* No auth data */
-
+    if ( reg->aflags & N2N_AFLAGS_LOCAL_SOCKET ) {
+        retval += encode_uint8( base, idx, 1 );
+        retval += encode_sock( base, idx, &reg->local_sock );
+    } else {
+        retval += encode_uint8( base, idx, 0 );
+    }
+    retval += encode_uint16( base, idx, 0 );
+    retval += encode_uint16( base, idx, 0 );
     return retval;
 }
 
@@ -318,14 +322,18 @@ size_t decode_REGISTER_SUPER( n2n_REGISTER_SUPER_t * reg,
     retval += decode_mac( reg->edgeMac, base, rem, idx );
     retval += decode_uint32( &(reg->dev_addr.net_addr), base, rem, idx );
     retval += decode_uint8( &(reg->dev_addr.net_bitlen), base, rem, idx );
-    /* skip num_local_socks and any local_socks entries */
     {
         uint8_t num_local = 0;
-        uint8_t i;
         retval += decode_uint8( &num_local, base, rem, idx );
-        for (i = 0; i < num_local && *rem >= 11; i++) {
+        if ( num_local > 0 && *rem >= 8 ) {
+            retval += decode_sock( &reg->local_sock, base, rem, idx );
+            reg->aflags |= N2N_AFLAGS_LOCAL_SOCKET;
+            num_local--;
+        }
+        while ( num_local > 0 && *rem >= 8 ) {
             n2n_sock_t tmp;
             retval += decode_sock( &tmp, base, rem, idx );
+            num_local--;
         }
     }
     retval += decode_uint16( &(reg->auth.scheme), base, rem, idx );
@@ -558,8 +566,11 @@ size_t encode_PEER_INFO( uint8_t * base, size_t * idx,
 {
     size_t retval = 0;
     retval += encode_common( base, idx, common );
+    retval += encode_uint16( base, idx, pkt->aflags );
     retval += encode_mac( base, idx, pkt->mac );
-    retval += encode_sock( base, idx, &pkt->sock );
+    retval += encode_sock( base, idx, &pkt->sockets[0] );
+    if ( pkt->aflags & N2N_AFLAGS_LOCAL_SOCKET )
+        retval += encode_sock( base, idx, &pkt->sockets[1] );
     return retval;
 }
 
@@ -570,7 +581,33 @@ size_t decode_PEER_INFO( n2n_PEER_INFO_t * pkt,
 {
     size_t retval = 0;
     memset( pkt, 0, sizeof(*pkt) );
+    retval += decode_uint16( &pkt->aflags, base, rem, idx );
     retval += decode_mac( pkt->mac, base, rem, idx );
-    retval += decode_sock( &pkt->sock, base, rem, idx );
+    retval += decode_sock( &pkt->sockets[0], base, rem, idx );
+    if ( (pkt->aflags & N2N_AFLAGS_LOCAL_SOCKET) && *rem >= 8 )
+        retval += decode_sock( &pkt->sockets[1], base, rem, idx );
+    return retval;
+}
+
+size_t encode_QUERY_PEER( uint8_t * base, size_t * idx,
+                          const n2n_common_t * common,
+                          const n2n_QUERY_PEER_t * pkt )
+{
+    size_t retval = 0;
+    retval += encode_common( base, idx, common );
+    retval += encode_mac( base, idx, pkt->srcMac );
+    retval += encode_mac( base, idx, pkt->targetMac );
+    return retval;
+}
+
+size_t decode_QUERY_PEER( n2n_QUERY_PEER_t * pkt,
+                          const n2n_common_t * cmn,
+                          const uint8_t * base,
+                          size_t * rem, size_t * idx )
+{
+    size_t retval = 0;
+    memset( pkt, 0, sizeof(*pkt) );
+    retval += decode_mac( pkt->srcMac, base, rem, idx );
+    retval += decode_mac( pkt->targetMac, base, rem, idx );
     return retval;
 }

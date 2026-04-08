@@ -56,7 +56,8 @@ enum n2n_pc
     n2n_federation=8,           /* Not used by edge */
     n2n_probe=9,                /* P2P hole-punch probe: edge->edge direct */
     n2n_probe_ack=10,           /* P2P hole-punch result: observed addr via supernode */
-    n2n_peer_info=11            /* Supernode pushes peer address to edge */
+    n2n_peer_info=11,           /* Supernode pushes peer address to edge */
+    n2n_query_peer=12           /* Edge asks supernode for peer address */
 };
 
 typedef enum n2n_pc n2n_pc_t;
@@ -154,12 +155,16 @@ typedef struct n2n_PACKET n2n_PACKET_t;
 
 
 /* Linked with n2n_register_super in n2n_pc_t. Only from edge to supernode. */
+#define N2N_AFLAGS_LOCAL_SOCKET  0x0001  /* local_sock field is valid */
+
 struct n2n_REGISTER_SUPER
 {
     n2n_cookie_t        cookie;         /* Link REGISTER_SUPER and REGISTER_SUPER_ACK */
     n2n_mac_t           edgeMac;        /* MAC to register with edge sending socket */
     n2n_ip_subnet_t     dev_addr;       /* IP address of the tuntap adapter (net_addr=0 to request auto-assign) */
     n2n_auth_t          auth;           /* Authentication scheme and tokens */
+    uint16_t            aflags;         /* additional flags (N2N_AFLAGS_*) */
+    n2n_sock_t          local_sock;     /* LAN address for same-NAT direct connect */
 };
 
 typedef struct n2n_REGISTER_SUPER n2n_REGISTER_SUPER_t;
@@ -348,8 +353,9 @@ size_t decode_PACKET( n2n_PACKET_t * pkt,
 
 /* PEER_INFO: supernode -> edge, push a peer's address */
 typedef struct n2n_PEER_INFO {
+    uint16_t   aflags;       /* N2N_AFLAGS_LOCAL_SOCKET if sockets[1] valid */
     n2n_mac_t  mac;
-    n2n_sock_t sock;
+    n2n_sock_t sockets[2];  /* [0]=public, [1]=LAN (if aflags set) */
 } n2n_PEER_INFO_t;
 
 size_t encode_PEER_INFO( uint8_t * base, size_t * idx,
@@ -361,4 +367,20 @@ size_t decode_PEER_INFO( n2n_PEER_INFO_t * pkt,
                          const uint8_t * base,
                          size_t * rem, size_t * idx );
 
+/* QUERY_PEER: edge -> supernode, ask for peer's public address */
+typedef struct n2n_QUERY_PEER {
+    n2n_mac_t  srcMac;
+    n2n_mac_t  targetMac;
+} n2n_QUERY_PEER_t;
+
+size_t encode_QUERY_PEER( uint8_t * base, size_t * idx,
+                          const n2n_common_t * common,
+                          const n2n_QUERY_PEER_t * pkt );
+
+size_t decode_QUERY_PEER( n2n_QUERY_PEER_t * pkt,
+                          const n2n_common_t * cmn,
+                          const uint8_t * base,
+                          size_t * rem, size_t * idx );
+
 #endif /* #if !defined( N2N_WIRE_H_ ) */
+

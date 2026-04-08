@@ -95,6 +95,8 @@ static int update_edge( n2n_sn_t * sss,
                         const n2n_mac_t edgeMac,
                         const n2n_community_t community,
                         const n2n_sock_t * sender_sock,
+                        const n2n_sock_t * local_sock,
+                        uint8_t local_sock_ena,
                         time_t now,
                         const char * version,
                         const char * os_name,
@@ -343,6 +345,8 @@ static int update_edge( n2n_sn_t * sss,
                         const n2n_mac_t edgeMac,
                         const n2n_community_t community,
                         const n2n_sock_t * sender_sock,
+                        const n2n_sock_t * local_sock,
+                        uint8_t local_sock_ena,
                         time_t now,
                         const char * version,
                         const char * os_name,
@@ -369,8 +373,10 @@ static int update_edge( n2n_sn_t * sss,
             uint32_t assigned_ip;
             if (requested_ip != 0) {
                 assigned_ip = ntohl(requested_ip);
-                traceEvent(TRACE_INFO, "Using requested IP 10.64.0.%u for edge %s",
-                           assigned_ip & 0xFF, macaddr_str(mac_buf, edgeMac));
+                traceEvent(TRACE_DEBUG, "Edge %s using static IP %u.%u.%u.%u",
+                           macaddr_str(mac_buf, edgeMac),
+                           (assigned_ip>>24)&0xFF, (assigned_ip>>16)&0xFF,
+                           (assigned_ip>>8)&0xFF, assigned_ip&0xFF);
             } else {
                 assigned_ip = next_assigned_ip++;
                 traceEvent(TRACE_INFO, "Auto-assigning IP 10.64.0.%u to edge %s",
@@ -400,12 +406,23 @@ static int update_edge( n2n_sn_t * sss,
         }
 
         /* insert this guy at the head of the edges list */
-        scan->next = sss->edges;     /* first in list */
-        sss->edges = scan;           /* head of list points to new scan */
+        scan->next = sss->edges;
+        sss->edges = scan;
 
-        traceEvent( TRACE_INFO, "update_edge created   %s ==> %s",
-                    macaddr_str( mac_buf, edgeMac ),
-                    sock_to_cstr( sockbuf, sender_sock ) );
+        scan->num_sockets  = local_sock_ena ? 2 : 1;
+        scan->sockets[0]   = scan->sock;
+        if (local_sock_ena && local_sock)
+            scan->sockets[1] = *local_sock;
+
+        {
+            struct in_addr vip_addr;
+            vip_addr.s_addr = scan->assigned_ip;
+            traceEvent( TRACE_NORMAL, "update_edge created   %s vip=%s ==> %s%s",
+                        macaddr_str( mac_buf, edgeMac ),
+                        inet_ntoa(vip_addr),
+                        sock_to_cstr( sockbuf, &scan->sockets[0] ),
+                        scan->num_sockets > 1 ? " (LAN)" : "" );
+        }
 
         scan->last_seen = now;
         return 1;  /* new edge */
@@ -431,6 +448,15 @@ static int update_edge( n2n_sn_t * sss,
             traceEvent( TRACE_INFO, "update_edge updated   %s ==> %s",
                         macaddr_str( mac_buf, edgeMac ),
                         sock_to_cstr( sockbuf, sender_sock ) );
+
+            if (local_sock_ena && local_sock) {
+                scan->num_sockets  = 2;
+                scan->sockets[0]   = scan->sock;
+                scan->sockets[1]   = *local_sock;
+            } else {
+                scan->num_sockets  = 1;
+                scan->sockets[0]   = scan->sock;
+            }
 
             scan->last_seen = now;
             return 1;  /* address changed - treat as new for peer push */
@@ -1040,6 +1066,38 @@ static int process_udp( n2n_sn_t * sss,
         traceEvent(TRACE_DEBUG, "Rx PROBE_ACK: forward to %s", macaddr_str((char[N2N_MACSTR_SIZE]){0}, ack.srcMac));
         try_forward(sss, &cmn, ack.srcMac, udp_buf, udp_size);
     }
+    else if ( msg_type == n2n_query_peer )
+    {
+        n2n_QUERY_PEER_t  query;
+        n2n_PEER_INFO_t   pi;
+        n2n_common_t      cmn2;
+        uint8_t           encbuf[N2N_SN_PKTBUF_SIZE];
+        size_t            encx = 0;
+
+        decode_QUERY_PEER( &query, &cmn, udp_buf, &rem, &idx );
+
+        struct peer_info *target = find_peer_by_mac( sss->edges, query.targetMac );
+        if ( target )
+        {
+            memset( &cmn2, 0, sizeof(cmn2) );
+            cmn2.ttl   = N2N_DEFAULT_TTL;
+            cmn2.pc    = n2n_peer_info;
+            cmn2.flags = N2N_FLAGS_FROM_SUPERNODE;
+            memcpy( cmn2.community, cmn.community, sizeof(n2n_community_t) );
+
+            memcpy( pi.mac, query.targetMac, N2N_MAC_SIZE );
+            pi.aflags = (target->num_sockets > 1 &&
+                         target->sockets[1].family != 0 &&
+                         target->sockets[1].port != 0) ? N2N_AFLAGS_LOCAL_SOCKET : 0;
+            pi.sockets[0] = target->sockets[0];
+            if (pi.aflags & N2N_AFLAGS_LOCAL_SOCKET)
+                pi.sockets[1] = target->sockets[1];
+
+            encode_PEER_INFO( encbuf, &encx, &cmn2, &pi );
+            sendto( sss->sock, encbuf, encx, 0,
+                    sender_sock, sizeof(struct sockaddr_in) );
+        }
+    }
     else if ( msg_type == MSG_TYPE_REGISTER_SUPER )
     {
         n2n_REGISTER_SUPER_t            reg;
@@ -1101,8 +1159,12 @@ static int process_udp( n2n_sn_t * sss,
         }
         uint8_t use_request_ip = (use_requested_ip != 0 || reg.dev_addr.net_bitlen == 0) ? 1 : 0;
 
-        int is_new_edge = update_edge( sss, reg.edgeMac, cmn.community, &(ack.sock), now,
-                     "", "", use_request_ip, htonl(use_requested_ip) );
+        const n2n_sock_t *local_sock_ptr = (reg.aflags & N2N_AFLAGS_LOCAL_SOCKET) ? &reg.local_sock : NULL;
+        uint8_t local_sock_ena = (reg.aflags & N2N_AFLAGS_LOCAL_SOCKET) ? 1 : 0;
+
+        int is_new_edge = update_edge( sss, reg.edgeMac, cmn.community, &(ack.sock),
+                     local_sock_ptr, local_sock_ena,
+                     now, "", "", use_request_ip, htonl(use_requested_ip) );
 
         /* Set assigned IP in ACK */
         if (use_request_ip) {
@@ -1147,7 +1209,17 @@ static int process_udp( n2n_sn_t * sss,
                     memcmp(p->mac_addr, reg.edgeMac, N2N_MAC_SIZE) != 0)
                 {
                     memcpy(pi.mac, p->mac_addr, N2N_MAC_SIZE);
-                    pi.sock = p->sock;
+                    pi.sockets[0] = p->sockets[0];
+                    /* Only set LOCAL_SOCKET flag if LAN address is actually valid */
+                    if (p->num_sockets > 1 &&
+                        p->sockets[1].family != 0 &&
+                        p->sockets[1].port != 0)
+                    {
+                        pi.aflags = N2N_AFLAGS_LOCAL_SOCKET;
+                        pi.sockets[1] = p->sockets[1];
+                    } else {
+                        pi.aflags = 0;
+                    }
                     pix = 0;
                     encode_PEER_INFO(pibuf, &pix, &pi_cmn, &pi);
                     sendto(send_sock, pibuf, pix, 0,

@@ -219,14 +219,18 @@ struct peer_info {
     struct peer_info *  next;
     n2n_community_t     community_name;
     n2n_mac_t           mac_addr;
-    n2n_sock_t          sock;
+    n2n_sock_t          sock;              /* primary (public) address */
+    int                 num_sockets;       /* 1=public only, 2=public+LAN */
+    n2n_sock_t          sockets[2];        /* [0]=public, [1]=LAN */
     time_t              last_seen;
     char                version[8];
     char                os_name[16];
     uint32_t            assigned_ip;
-    time_t              punch_start_time;   /* when hole-punch started, 0=not started */
-    uint8_t             punch_failed;       /* 1=gave up, use supernode relay only */
-    time_t              punch_reset_time;   /* when punch_failed was last reset, for periodic retry */
+    time_t              punch_start_time;
+    uint8_t             punch_failed;
+    time_t              punch_reset_time;
+    time_t              lan_punch_start;   /* when LAN punch started, 0=not started */
+    uint8_t             lan_punch_done;    /* 1=LAN succeeded or timed out, proceed to WAN */
 };
 
 struct n2n_edge; /* defined in edge.c */
