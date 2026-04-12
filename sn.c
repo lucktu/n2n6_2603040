@@ -12,6 +12,7 @@
 #include "n2n_transforms.h"
 #include "n2n_wire.h"
 #include <fcntl.h>
+#include <inttypes.h>
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -155,23 +156,41 @@ static void update_community_traffic(struct community_stats *s, size_t bytes, ti
     s->total_bytes += bytes;
     s->last_active  = now;
 
-    /* Instant rate */
+    /* Instant rate: advance and zero skipped buckets so idle communities decay to 0 */
     if (now != s->last_second) {
+        int diff = (int)(now - s->last_second);
+        if (diff >= COMM_STATS_SECONDS) {
+            memset(s->recent_seconds, 0, sizeof(s->recent_seconds));
+            s->recent_idx = 0;
+        } else {
+            while (diff-- > 0) {
+                s->recent_idx = (s->recent_idx + 1) % COMM_STATS_SECONDS;
+                s->recent_seconds[s->recent_idx] = 0;
+            }
+        }
         s->last_second = now;
-        s->recent_idx  = (s->recent_idx + 1) % COMM_STATS_SECONDS;
-        s->recent_seconds[s->recent_idx] = 0;
         uint64_t total = 0;
         for (int k = 0; k < COMM_STATS_SECONDS; k++) total += s->recent_seconds[k];
         s->instant_bps = total / COMM_STATS_SECONDS;
     }
     s->recent_seconds[s->recent_idx] += bytes;
 
-    /* 24h sliding window */
-    if (now - s->last_minute >= 60) {
+    /* 24h sliding window - guard against time jumps */
+    if (s->last_minute > now || now - s->last_minute > 7200) {
+        /* Time jump: recalculate from buckets */
+        uint64_t total = 0;
+        for (int k = 0; k < COMM_STATS_MINUTES; k++) total += s->bytes_1440[k];
+        s->last_24h_bytes = total;
         s->last_minute = now;
-        s->min_idx = (s->min_idx + 1) % COMM_STATS_MINUTES;
-        s->last_24h_bytes -= s->bytes_1440[s->min_idx];
-        s->bytes_1440[s->min_idx] = 0;
+    } else if (now - s->last_minute >= 60) {
+        int mdiff = (now - s->last_minute) / 60;
+        if (mdiff > COMM_STATS_MINUTES) mdiff = COMM_STATS_MINUTES;
+        while (mdiff-- > 0) {
+            s->min_idx = (s->min_idx + 1) % COMM_STATS_MINUTES;
+            s->last_24h_bytes -= s->bytes_1440[s->min_idx];
+            s->bytes_1440[s->min_idx] = 0;
+        }
+        s->last_minute = now;
     }
     s->bytes_1440[s->min_idx] += bytes;
     s->last_24h_bytes += bytes;
@@ -247,6 +266,23 @@ static void free_community_stats(struct community_stats **head)
     *head = NULL;
 }
 
+/* Derive .dat path from config path */
+static void stats_dat_path(const char *cfg, char *out, size_t sz)
+{
+    strncpy(out, cfg, sz - 1);
+    out[sz - 1] = '\0';
+    char *dot = strrchr(out, '.');
+    char *slash = strrchr(out, '/');
+#ifdef _WIN32
+    char *bslash = strrchr(out, '\\');
+    if (!slash || (bslash && bslash > slash)) slash = bslash;
+#endif
+    if (dot && dot > slash)
+        strcpy(dot, ".dat");
+    else
+        strncat(out, ".dat", sz - strlen(out) - 1);
+}
+
 /* Free all rate limit rules */
 static void free_rate_limit_rules(struct rate_limit_rule **head)
 {
@@ -272,11 +308,20 @@ static void parse_rate_limit_config(const char *path,
         /* Create default config */
         fp = fopen(path, "w");
         if (fp) {
-            fprintf(fp, "# Traffic statistics and rate limiting configuration\n");
+            fprintf(fp, "# N2N Supernode traffic statistics and rate limiting\n");
             fprintf(fp, "# enabled on|off\n");
-            fprintf(fp, "# Format: <community> <rate_limit_KB/s> <max_24h_traffic_GB>\n");
-            fprintf(fp, "# Example: n2n  10  50\n");
-            fprintf(fp, "# Example: *    0   100   (global 100GB/24h hard block)\n");
+            fprintf(fp, "#\n");
+            fprintf(fp, "# Rules: <community> <rate_limit_KB/s> <max_24h_GB>\n");
+            fprintf(fp, "#   community       : community name, or * for all\n");
+            fprintf(fp, "#   rate_limit_KB/s : speed after 24h limit exceeded (0=block)\n");
+            fprintf(fp, "#   max_24h_GB      : 24h traffic cap (0=unlimited)\n");
+            fprintf(fp, "# Later rules override earlier ones; specific name beats *\n");
+            fprintf(fp, "#\n");
+            fprintf(fp, "# Examples:\n");
+            fprintf(fp, "#*          0    100    # global: block after 100GB/24h\n");
+            fprintf(fp, "#n2n       10     50    # n2n: throttle to 10KB/s after 50GB/24h\n");
+            fprintf(fp, "#vip        0      0    # vip: unlimited\n");
+            fprintf(fp, "\n");
             fprintf(fp, "enabled on\n");
             fclose(fp);
         }
@@ -343,6 +388,147 @@ struct n2n_sn
 };
 
 typedef struct n2n_sn n2n_sn_t;
+
+/* Save stats to text file (every 5 minutes) */
+static void save_community_stats(n2n_sn_t *sss, time_t now)
+{
+    static time_t last_save = 0;
+    if (now - last_save < 300) return;
+    last_save = now;
+
+    char path[512];
+    stats_dat_path(sss->stats_config_path, path, sizeof(path));
+    FILE *fp = fopen(path, "w");
+    if (!fp) return;
+
+    struct community_stats *s = sss->comm_stats;
+    while (s) {
+        fprintf(fp, "%s %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64
+                    " %d %" PRId64 " %d %" PRId64 "\n",
+                (char*)s->community_name,
+                (uint64_t)s->last_active,
+                s->total_bytes,
+                s->last_24h_bytes,
+                s->total_30d,
+                s->day_idx, (int64_t)s->last_day,
+                s->min_idx, (int64_t)s->last_minute);
+        for (int i = 0; i < COMM_STATS_DAYS; i++)
+            fprintf(fp, "%" PRIu64 "%c", s->bytes_30d[i], i == COMM_STATS_DAYS-1 ? '\n' : ' ');
+        s = s->next;
+    }
+    fclose(fp);
+}
+
+/* Load stats from text file at startup */
+static void load_community_stats(n2n_sn_t *sss)
+{
+    char path[512];
+    stats_dat_path(sss->stats_config_path, path, sizeof(path));
+    FILE *fp = fopen(path, "r");
+    if (!fp) return;
+
+    time_t now = time(NULL);
+    char line[256];
+    while (fgets(line, sizeof(line), fp)) {
+        char cname[N2N_COMMUNITY_SIZE + 1] = {0};
+        uint64_t last_active, total_bytes, last_24h, total_30d;
+        int day_idx, min_idx;
+        int64_t last_day, last_minute;
+        if (sscanf(line, "%32s %" SCNu64 " %" SCNu64 " %" SCNu64 " %" SCNu64
+                         " %d %" SCNd64 " %d %" SCNd64,
+                   cname, &last_active, &total_bytes, &last_24h, &total_30d,
+                   &day_idx, &last_day, &min_idx, &last_minute) != 9)
+            continue;
+
+        char bline[512];
+        if (!fgets(bline, sizeof(bline), fp)) break;
+
+        struct community_stats *s = get_community_stats(&sss->comm_stats,
+                                        (const uint8_t*)cname, now);
+        if (!s) continue;
+
+        s->last_active    = (time_t)last_active;
+        s->total_bytes    = total_bytes;
+        s->last_24h_bytes = last_24h;
+        s->total_30d      = total_30d;
+        s->day_idx        = day_idx;
+        s->last_day       = (time_t)last_day;
+        s->min_idx        = min_idx;
+        s->last_minute    = (time_t)last_minute;
+
+        char *p = bline;
+        for (int i = 0; i < COMM_STATS_DAYS; i++) {
+            uint64_t v = 0;
+            sscanf(p, "%" SCNu64, &v);
+            s->bytes_30d[i] = v;
+            p = strchr(p, ' ');
+            if (!p) break;
+            p++;
+        }
+
+        /* Advance expired 30d buckets */
+        if (s->last_day > 0 && now - s->last_day >= 86400) {
+            int ddiff = (now - s->last_day) / 86400;
+            if (ddiff > COMM_STATS_DAYS) ddiff = COMM_STATS_DAYS;
+            while (ddiff-- > 0) {
+                s->day_idx = (s->day_idx + 1) % COMM_STATS_DAYS;
+                if (s->total_30d >= s->bytes_30d[s->day_idx])
+                    s->total_30d -= s->bytes_30d[s->day_idx];
+                else
+                    s->total_30d = 0;
+                s->bytes_30d[s->day_idx] = 0;
+            }
+            s->last_day = now;
+        }
+    }
+    fclose(fp);
+    traceEvent(TRACE_NORMAL, "Traffic stats loaded from %s", path);
+}
+
+#define PURGE_STATS_FREQUENCY  30   /* seconds between community stats purge runs */
+
+/* Purge community stats: remove entries idle >= 30d; advance expired 30d buckets for others */
+static void purge_expired_community_stats(n2n_sn_t *sss, time_t *p_last_purge, time_t now)
+{
+    if (now - *p_last_purge < PURGE_STATS_FREQUENCY) return;
+    *p_last_purge = now;
+
+    struct community_stats **pp = &sss->comm_stats;
+    while (*pp) {
+        struct community_stats *s = *pp;
+        time_t idle = now - s->last_active;
+
+        if (idle >= 30 * 86400) {
+            /* Remove entirely */
+            *pp = s->next;
+            free(s);
+            continue;
+        }
+
+        /* Advance expired 30d buckets */
+        if (s->last_day > 0 && now - s->last_day >= 86400) {
+            int ddiff = (now - s->last_day) / 86400;
+            if (ddiff > COMM_STATS_DAYS) ddiff = COMM_STATS_DAYS;
+            while (ddiff-- > 0) {
+                s->day_idx = (s->day_idx + 1) % COMM_STATS_DAYS;
+                if (s->total_30d >= s->bytes_30d[s->day_idx])
+                    s->total_30d -= s->bytes_30d[s->day_idx];
+                else
+                    s->total_30d = 0;
+                s->bytes_30d[s->day_idx] = 0;
+            }
+            s->last_day = now;
+            /* If 30d traffic is now zero, remove */
+            if (s->total_30d == 0) {
+                *pp = s->next;
+                free(s);
+                continue;
+            }
+        }
+
+        pp = &s->next;
+    }
+}
 
 static int update_edge( n2n_sn_t * sss,
                         const n2n_mac_t edgeMac,
@@ -799,7 +985,6 @@ static int process_mgmt( n2n_sn_t * sss,
     struct peer_info *list;
     n2n_community_t communities[256];
     struct peer_info *community_edges[256];
-    int community_counts[256];
     int num_communities = 0;
     uint32_t num_edges = 0;
 
@@ -839,7 +1024,6 @@ static int process_mgmt( n2n_sn_t * sss,
                 memcpy(new_edge, list, sizeof(struct peer_info));
                 new_edge->next = community_edges[i];
                 community_edges[i] = new_edge;
-                community_counts[i]++;
                 found = 1;
                 break;
             }
@@ -863,7 +1047,6 @@ static int process_mgmt( n2n_sn_t * sss,
             }
             memcpy(community_edges[num_communities], list, sizeof(struct peer_info));
             community_edges[num_communities]->next = NULL;
-            community_counts[num_communities] = 1;
             num_communities++;
         }
 
@@ -879,11 +1062,11 @@ static int process_mgmt( n2n_sn_t * sss,
             struct community_stats *cs = sss->comm_stats;
             while (cs && memcmp(cs->community_name, communities[i], sizeof(n2n_community_t)) != 0)
                 cs = cs->next;
-            if (cs && cs->total_bytes > 0) {
+            if (cs && cs->total_30d > 0) {
                 double kbps   = cs->instant_bps / 1024.0;
                 double gb_24h = cs->last_24h_bytes / (1024.0*1024.0*1024.0);
                 double gb_30d = cs->total_30d / (1024.0*1024.0*1024.0);
-                const char *arrow = (kbps > 0.0) ? "--->" : "    ";
+                const char *arrow = (cs->instant_bps > 0) ? "--->" : "    ";
                 ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE,
                                    "%-57s  %s %-7.1f  %-7.1f  %-10.1f\n",
                                    communities[i], arrow, kbps, gb_24h, gb_30d);
@@ -944,8 +1127,7 @@ static int process_mgmt( n2n_sn_t * sss,
                 snprintf(virt_ip, sizeof(virt_ip), "%s", inet_ntoa(a));
 
             ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE,
-                          //  "  %2u  %-17s  %-20s %-26s  %-7s  %s\n",
-				              "  %2u  %-17s  %-15s  %-47s  %-7s  %s\n",
+                               "  %2u  %-17s  %-15s  %-47s  %-7s  %s\n",
                               id++,
                               macaddr_str(mac_buf, edge->mac_addr),
                               virt_ip,
@@ -965,6 +1147,53 @@ static int process_mgmt( n2n_sn_t * sss,
 
     num_edges = displayed_edges;
 
+    /* Offline communities: in comm_stats but no current edges */
+    if (sss->traffic_stats_enabled) {
+        double off_kbps = 0.0, off_24h = 0.0, off_30d = 0.0;
+        struct community_stats *cs = sss->comm_stats;
+        while (cs) {
+            int online = 0;
+            for (int i = 0; i < num_communities; i++) {
+                if (memcmp(communities[i], cs->community_name, sizeof(n2n_community_t)) == 0) {
+                    online = 1;
+                    break;
+                }
+            }
+            if (!online) {
+                time_t idle = now - cs->last_active;
+                if (idle < 86400) {
+                    /* Offline < 24h: show individually */
+                    if (cs->total_30d > 0) {
+                        double kbps  = cs->instant_bps / 1024.0;
+                        double gb24h = cs->last_24h_bytes / (1024.0*1024.0*1024.0);
+                        double gb30d = cs->total_30d / (1024.0*1024.0*1024.0);
+                        const char *arrow = (cs->instant_bps > 0) ? "--->" : "    ";
+                        ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE,
+                                           "%-57s  %s %-7.1f  %-7.1f  %-10.1f\n",
+                                           cs->community_name, arrow, kbps, gb24h, gb30d);
+                    } else {
+                        ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE, "%s\n",
+                                           cs->community_name);
+                    }
+                    r = sendto(sss->mgmt_sock, resbuf, ressize, 0, sender_sock, sender_sock_len);
+                    if (r <= 0) return -1;
+                } else {
+                    /* Offline >= 24h: fold into summary */
+                    off_kbps += cs->instant_bps / 1024.0;
+                    off_24h  += cs->last_24h_bytes / (1024.0*1024.0*1024.0);
+                    off_30d  += cs->total_30d / (1024.0*1024.0*1024.0);
+                }
+            }
+            cs = cs->next;
+        }
+        if (off_30d > 0) {
+            ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE,
+                               "%-57s       %-7.1f  %-7.1f  %-10.1f\n",
+                               "offline_community/24h", off_kbps, off_24h, off_30d);
+            sendto(sss->mgmt_sock, resbuf, ressize, 0, sender_sock, sender_sock_len);
+        }
+    }
+
     /* Traffic Total line - before the footer separator */
     if (sss->traffic_stats_enabled) {
         double total_kbps = 0.0, total_24h = 0.0, total_30d = 0.0;
@@ -982,7 +1211,6 @@ static int process_mgmt( n2n_sn_t * sss,
                                "Total traffic                                              %s %-7.1f  %-7.1f  %-10.1f\n",
                                tarrow, total_kbps, total_24h, total_30d);
             sendto(sss->mgmt_sock, resbuf, ressize, 0, sender_sock, sender_sock_len);
-            ressize = 0;
         }
     }
 
@@ -1664,6 +1892,8 @@ int main( int argc, char * const argv[] )
                 parse_rate_limit_config(sss.stats_config_path,
                                         &sss.traffic_stats_enabled,
                                         &sss.rate_rules);
+                if (sss.traffic_stats_enabled)
+                    load_community_stats(&sss);
                 traceEvent(TRACE_NORMAL, "Traffic stats %s, config: %s",
                            sss.traffic_stats_enabled ? "enabled" : "disabled",
                            sss.stats_config_path);
@@ -1881,6 +2111,11 @@ static int run_loop( n2n_sn_t * sss )
         }
 
         purge_expired_registrations( &(sss->edges) );
+        if (sss->traffic_stats_enabled) {
+            static time_t last_stats_purge = 0;
+            purge_expired_community_stats(sss, &last_stats_purge, now);
+            save_community_stats(sss, now);
+        }
     }
 
     deinit_sn( sss );

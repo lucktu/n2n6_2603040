@@ -13,7 +13,7 @@ N2N_SUPERNODE="gw1.example.com"
 
 # Sets the n2n virtual LAN IP address being claimed. This is a private IP
 # address. All IP addresses in an n2n community typical belong to the same /24
-# net‐ work (ie. only the last octet of the IP addresses varies).
+# net- work (ie. only the last octet of the IP addresses varies).
 N2N_IP="10.10.10.11"
 
 # Uncomment this to get edge node started.
