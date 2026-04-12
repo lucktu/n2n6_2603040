@@ -2620,6 +2620,10 @@ static void readFromIPSocket( n2n_edge_t * eee )
                     try_send_register(eee, 1, pi.mac, &pi.sockets[0]);
                 }
             } else if (sock_equal(&known->sock, &pi.sockets[0]) != 0) {
+                /* Check if known->sock is the LAN address matching pi.sockets[1] */
+                int lan_match = (pi.aflags & N2N_AFLAGS_LOCAL_SOCKET) &&
+                                sock_equal(&known->sock, &pi.sockets[1]) == 0;
+                if (!lan_match) {
                 /* Peer address changed: move back to pending and re-punch */
                 traceEvent(TRACE_NORMAL, "Peer %s addr changed, re-punching",
                            macaddr_str(mac_buf1, pi.mac));
@@ -2661,6 +2665,7 @@ static void readFromIPSocket( n2n_edge_t * eee )
                 {
                     try_send_register(eee, 1, pi.mac, &pi.sockets[0]);
                 }
+                } /* end if (!lan_match) */
             }
             PEERS_UNLOCK(eee);
         }
