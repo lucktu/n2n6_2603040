@@ -103,7 +103,8 @@ struct n2n_edge
     int                 null_transop;           /**< Only allowed if no key sources defined. */
     char                supernode_version[16];
 
-    SOCKET              udp_sock;
+    SOCKET              udp_sock;                /**< IPv4 UDP socket */
+    SOCKET              udp_sock6;               /**< IPv6 UDP socket (-1 if unavailable) */
     SOCKET              mgmt_sock;               /**< socket for status info. */
 
     tuntap_dev          device;                 /**< All about the TUNTAP device */
@@ -381,6 +382,7 @@ static int edge_init(n2n_edge_t * eee)
     /* community_name set to NULLs by memset */
     eee->null_transop   = 0;
     eee->udp_sock       = -1;
+    eee->udp_sock6      = -1;
     eee->mgmt_sock      = -1;
     eee->dyn_ip_mode    = 0;
     eee->allow_routing  = 0;
@@ -474,14 +476,13 @@ static int n2n_tick_transop( n2n_edge_t * eee, time_t now )
 static void edge_deinit(n2n_edge_t * eee)
 {
     if ( eee->udp_sock != -1 )
-    {
         closesocket( eee->udp_sock );
-    }
+
+    if ( eee->udp_sock6 != -1 )
+        closesocket( eee->udp_sock6 );
 
     if ( eee->mgmt_sock != -1 )
-    {
         closesocket(eee->mgmt_sock);
-    }
 
     clear_peer_list( &(eee->pending_peers) );
     clear_peer_list( &(eee->known_peers) );
@@ -497,7 +498,7 @@ static void edge_deinit(n2n_edge_t * eee)
 #endif
 }
 
-static void readFromIPSocket( n2n_edge_t * eee );
+static void readFromIPSocket( n2n_edge_t * eee, SOCKET fd );
 
 static void readFromMgmtSocket( n2n_edge_t * eee, int * keep_running );
 
@@ -594,6 +595,14 @@ static ssize_t sendto_sock( SOCKET fd, const void * buf, size_t len, const n2n_s
     return sent;
 }
 
+/** Select the correct UDP socket based on destination address family */
+static inline SOCKET sock_for_dest( const n2n_edge_t * eee, const n2n_sock_t * dest )
+{
+    if ( dest->family == AF_INET6 && eee->udp_sock6 != -1 )
+        return eee->udp_sock6;
+    return eee->udp_sock;
+}
+
 
 /** Send a REGISTER packet to another edge. */
 static void send_register( n2n_edge_t * eee,
@@ -632,7 +641,7 @@ static void send_register( n2n_edge_t * eee,
     traceEvent( TRACE_INFO, "send REGISTER %s",
         sock_to_cstr( sockbuf, remote_peer ) );
 
-    sendto_sock( eee->udp_sock, pktbuf, idx, remote_peer );
+    sendto_sock( sock_for_dest(eee, remote_peer), pktbuf, idx, remote_peer );
 }
 
 
@@ -702,7 +711,7 @@ static void send_query_peer( n2n_edge_t * eee, const n2n_mac_t targetMac )
     memcpy(query.targetMac, targetMac,            N2N_MAC_SIZE);
 
     encode_QUERY_PEER(pktbuf, &idx, &cmn, &query);
-    sendto_sock(eee->udp_sock, pktbuf, idx, &(eee->supernode));
+    sendto_sock(sock_for_dest(eee, &eee->supernode), pktbuf, idx, &(eee->supernode));
 }
 
 /** Send a REGISTER_SUPER packet to the current supernode. */
@@ -746,7 +755,7 @@ static void send_register_super( n2n_edge_t * eee,
     traceEvent( TRACE_INFO, "send REGISTER_SUPER to %s",
         sock_to_cstr( sockbuf, supernode ) );
 
-    sendto_sock( eee->udp_sock, pktbuf, idx, supernode );
+    sendto_sock( sock_for_dest(eee, supernode), pktbuf, idx, supernode );
 
 }
 
@@ -780,7 +789,7 @@ static void send_register_ack( n2n_edge_t * eee,
         sock_to_cstr( sockbuf, remote_peer ) );
 
 
-    sendto_sock( eee->udp_sock, pktbuf, idx, remote_peer );
+    sendto_sock( sock_for_dest(eee, remote_peer), pktbuf, idx, remote_peer );
 }
 
 
@@ -803,7 +812,7 @@ static void send_deregister(n2n_edge_t * eee,
 
     idx = 0;
     encode_DEREGISTER(pktbuf, &idx, &cmn, &reg);
-    sendto_sock(eee->udp_sock, pktbuf, idx, remote_peer);
+    sendto_sock(sock_for_dest(eee, remote_peer), pktbuf, idx, remote_peer);
 }
 
 /** Check if two sockets are on the same public IP (same LAN behind same NAT) */
@@ -838,7 +847,7 @@ static void send_probe( n2n_edge_t * eee, const n2n_sock_t * peer_sock, const n2
     encode_PROBE(pktbuf, &idx, &cmn, &probe);
 
     traceEvent(TRACE_INFO, "send PROBE to %s", sock_to_cstr(sockbuf, peer_sock));
-    sendto_sock(eee->udp_sock, pktbuf, idx, peer_sock);
+    sendto_sock(sock_for_dest(eee, peer_sock), pktbuf, idx, peer_sock);
 }
 
 /** Send PROBE_ACK via supernode: tell srcMac what addr we observed from their PROBE */
@@ -865,7 +874,7 @@ static void send_probe_ack( n2n_edge_t * eee,
 
     traceEvent(TRACE_INFO, "send PROBE_ACK via supernode for %s",
                macaddr_str((char[N2N_MACSTR_SIZE]){0}, srcMac));
-    sendto_sock(eee->udp_sock, pktbuf, idx, &eee->supernode);
+    sendto_sock(sock_for_dest(eee, &eee->supernode), pktbuf, idx, &eee->supernode);
 }
 
 static int is_empty_ip_address( const n2n_sock_t * sock );
@@ -881,8 +890,8 @@ static void start_punch( n2n_edge_t * eee, struct peer_info * peer )
     if ( !is_empty_ip_address(&eee->my_public_sock) &&
          same_public_ip(&eee->my_public_sock, &peer->sock) ) return;
 
-    /* Skip punch if address family mismatch - no direct path possible */
-    if ( peer->sock.family != eee->supernode.family ) return;
+    /* Skip punch if we don't have the right socket for this peer's address family */
+    if ( peer->sock.family == AF_INET6 && eee->udp_sock6 == -1 ) return;
 
     peer->punch_start_time = time(NULL);
     peer->last_punch_probe = peer->punch_start_time;
@@ -924,8 +933,10 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
                     (now - scan->punch_start_time) <= 5 &&
                     (now - scan->last_punch_probe) >= 1 )
         {
-            /* Retransmit PROBE every 1s for first 5s - skip if family mismatch */
-            if ( scan->sock.family == eee->supernode.family ) {
+            /* Retransmit PROBE every 1s for first 5s - skip if no socket for this family */
+            if ( scan->sock.family == AF_INET6 && eee->udp_sock6 == -1 ) {
+                /* no IPv6 socket, can't punch */
+            } else {
                 send_probe(eee, &scan->sock, scan->mac_addr);
                 scan->last_punch_probe = now;
             }
@@ -995,8 +1006,14 @@ static void check_keepalive( n2n_edge_t * eee, time_t now )
         struct peer_info *next = scan->next;
         time_t idle = now - scan->last_seen;
 
-        /* Skip keepalive for peers with mismatched address family - relay only, no direct path */
-        if ( scan->sock.family != eee->supernode.family ) {
+        /* Skip keepalive for IPv4-only peers if we have no IPv4 socket (shouldn't happen) */
+        if ( scan->sock.family == AF_INET && eee->udp_sock == -1 ) {
+            prev = scan;
+            scan = next;
+            continue;
+        }
+        /* Skip keepalive for IPv6-only peers if we have no IPv6 socket */
+        if ( scan->sock.family == AF_INET6 && eee->udp_sock6 == -1 ) {
             prev = scan;
             scan = next;
             continue;
@@ -1019,11 +1036,11 @@ static void check_keepalive( n2n_edge_t * eee, time_t now )
                 memcpy(probe.dstMac, scan->mac_addr, N2N_MAC_SIZE);
 
                 encode_PROBE(pktbuf, &idx, &cmn, &probe);
-                sendto_sock(eee->udp_sock, pktbuf, idx, &scan->sock);
+                sendto_sock(sock_for_dest(eee, &scan->sock), pktbuf, idx, &scan->sock);
 
                 scan->last_probe_sent = now;
                 traceEvent(TRACE_INFO, "Keepalive PROBE sent to %s (idle %lds)",
-                           macaddr_str((char[N2N_MACSTR_SIZE]){0}, scan->mac_addr), (long)idle);
+                           macaddr_str((macstr_t){0}, scan->mac_addr), (long)idle);
             }
         } else {
             /* Probe already sent: check if reply came back */
@@ -1519,8 +1536,8 @@ static int find_peer_destination(n2n_edge_t * eee,
             if (scan->last_probe_sent > 0) {
                 break; /* retval stays 0, use supernode as fallback */
             }
-            /* Prefer IPv6 if both sides connected via IPv6 */
-            if (scan->sock6.family == AF_INET6 && eee->supernode.family == AF_INET6)
+            /* Prefer IPv6 direct if peer has IPv6 and we have IPv6 socket */
+            if (scan->sock6.family == AF_INET6 && eee->udp_sock6 != -1)
                 memcpy(destination, &scan->sock6, sizeof(n2n_sock_t));
             else
                 memcpy(destination, &scan->sock, sizeof(n2n_sock_t));
@@ -1580,7 +1597,7 @@ static int send_PACKET( n2n_edge_t * eee,
 
     traceEvent( TRACE_INFO, "send_PACKET to %s", sock_to_cstr( sockbuf, &destination ) );
 
-    sendto_sock( eee->udp_sock, pktbuf, pktlen, &destination );
+    sendto_sock( sock_for_dest(eee, &destination), pktbuf, pktlen, &destination );
 
     /* If routing via supernode for a unicast peer, re-register with supernode
      * and query peer's latest address - triggers full reconnect like a restart. */
@@ -2169,7 +2186,7 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
 }
 
 /** Read a datagram from the main UDP socket to the internet. */
-static void readFromIPSocket( n2n_edge_t * eee )
+static void readFromIPSocket( n2n_edge_t * eee, SOCKET fd )
 {
     n2n_common_t        cmn; /* common fields in the packet header */
 
@@ -2194,7 +2211,7 @@ static void readFromIPSocket( n2n_edge_t * eee )
     size_t              i;
 
     i = sizeof(sender_sock);
-    recvlen = recvfrom(eee->udp_sock, udp_buf, N2N_PKT_BUF_SIZE, 0/*flags*/,
+    recvlen = recvfrom(fd, udp_buf, N2N_PKT_BUF_SIZE, 0/*flags*/,
                       (struct sockaddr*) &sender_sock, (socklen_t*) &i);
 
     if ( recvlen < 0 )
@@ -2458,10 +2475,10 @@ static void readFromIPSocket( n2n_edge_t * eee )
             PEERS_LOCK(eee);
             struct peer_info *known = find_peer_by_mac(eee->known_peers, pi.mac);
             if (!known) {
-                /* New peer: IPv6 preferred if both sides have it */
+                /* New peer: IPv6 preferred if we have IPv6 socket and peer has IPv6 */
                 if ((pi.aflags & N2N_AFLAGS_IPV6_SOCKET) &&
                     pi.sock6.family == AF_INET6 &&
-                    eee->supernode.family == AF_INET6)
+                    eee->udp_sock6 != -1)
                 {
                     traceEvent(TRACE_NORMAL, "IPv6 direct: trying %s",
                                sock_to_cstr(sockbuf1, &pi.sock6));
@@ -2479,10 +2496,10 @@ static void readFromIPSocket( n2n_edge_t * eee )
                                sock_to_cstr(sockbuf1, &lan_sock));
                     try_send_register_lan(eee, 1, pi.mac, &pi.sockets[0], &lan_sock);
                 }
-                else if (pi.sockets[0].family != eee->supernode.family)
+                else if (pi.sockets[0].family == AF_INET6 && eee->udp_sock6 == -1)
                 {
-                    /* Address family mismatch - can't punch directly, supernode will relay */
-                    traceEvent(TRACE_DEBUG, "Peer %s addr family mismatch, relay only",
+                    /* Peer is IPv6-only but we have no IPv6 socket - relay only */
+                    traceEvent(TRACE_DEBUG, "Peer %s is IPv6-only but no local IPv6 socket, relay only",
                                macaddr_str(mac_buf1, pi.mac));
                 }
                 else
@@ -2510,7 +2527,7 @@ static void readFromIPSocket( n2n_edge_t * eee )
                 /* Re-punch with new address */
                 if ((pi.aflags & N2N_AFLAGS_IPV6_SOCKET) &&
                     pi.sock6.family == AF_INET6 &&
-                    eee->supernode.family == AF_INET6)
+                    eee->udp_sock6 != -1)
                 {
                     traceEvent(TRACE_NORMAL, "IPv6 direct re-punch: %s",
                                sock_to_cstr(sockbuf1, &pi.sock6));
@@ -2526,9 +2543,9 @@ static void readFromIPSocket( n2n_edge_t * eee )
                     lan_sock.port = pi.sockets[0].port;
                     try_send_register_lan(eee, 1, pi.mac, &pi.sockets[0], &lan_sock);
                 }
-                else if (pi.sockets[0].family != eee->supernode.family)
+                else if (pi.sockets[0].family == AF_INET6 && eee->udp_sock6 == -1)
                 {
-                    traceEvent(TRACE_DEBUG, "Peer %s addr family mismatch on re-punch, relay only",
+                    traceEvent(TRACE_DEBUG, "Peer %s re-punch: IPv6-only but no local IPv6 socket, relay only",
                                macaddr_str(mac_buf1, pi.mac));
                 }
                 else
@@ -3395,7 +3412,7 @@ if (argc > 1 && argv[1][0] != '-' && access(argv[1], R_OK) == 0) {
         exit(1);
     }
 
-    traceEvent( TRACE_NORMAL, "Starting n2n edge %s %s", n2n_sw_version, n2n_sw_buildDate );
+    traceEvent( TRACE_NORMAL, "\nStarting n2n edge %s %s", n2n_sw_version, n2n_sw_buildDate );
 
     for (int i = 0; i< eee.sn_num; ++i) {
         /* Skip the default supernode (last one if it matches default) */
@@ -3556,12 +3573,20 @@ if (argc > 1 && argv[1][0] != '-' && access(argv[1], R_OK) == 0) {
       }
   }
 
-    eee.udp_sock = eee.supernode.family == AF_INET ? open_socket(local_port, 1 /*bind ANY*/ ) : open_socket6(local_port, 1 ) ;
+    eee.udp_sock = open_socket(local_port, 1 /*bind ANY*/ );
     if(eee.udp_sock == -1)
     {
         traceEvent( TRACE_ERROR, "Failed to bind main UDP port %u", (signed int)local_port );
         return(-1);
     }
+
+    /* Try to open IPv6 socket on same port for dual-stack support */
+    eee.udp_sock6 = open_socket6(local_port, 1 /*bind ANY*/);
+    if(eee.udp_sock6 == -1)
+        traceEvent(TRACE_WARNING, "IPv6 UDP socket unavailable, IPv6 peers will use relay only");
+    else
+        traceEvent(TRACE_NORMAL, "Dual-stack: IPv4+IPv6 UDP sockets ready (supernode via %s)",
+                   eee.supernode.family == AF_INET6 ? "IPv6" : "IPv4");
 
 #if !defined(_WIN32)
     if (mgmt_port == 0)
@@ -3628,6 +3653,10 @@ static int run_loop(n2n_edge_t * eee )
         FD_ZERO(&socket_mask);
         FD_SET(eee->udp_sock, &socket_mask);
         max_sock = (int) eee->udp_sock;
+        if (eee->udp_sock6 != -1) {
+            FD_SET(eee->udp_sock6, &socket_mask);
+            max_sock = max(max_sock, (int) eee->udp_sock6);
+        }
         if (eee->mgmt_sock != -1) {
             FD_SET(eee->mgmt_sock, &socket_mask);
             max_sock = max(max_sock, (int) eee->mgmt_sock);
@@ -3673,9 +3702,12 @@ static int run_loop(n2n_edge_t * eee )
             /* Any or all of the FDs could have input; check them all. */
             if(FD_ISSET(eee->udp_sock, &socket_mask))
             {
-                /* Read a cooked socket from the internet socket. Writes on the TAP
-                 * socket. */
-                readFromIPSocket(eee);
+                readFromIPSocket(eee, eee->udp_sock);
+            }
+
+            if(eee->udp_sock6 != -1 && FD_ISSET(eee->udp_sock6, &socket_mask))
+            {
+                readFromIPSocket(eee, eee->udp_sock6);
             }
 
             if(eee->mgmt_sock != -1 && FD_ISSET(eee->mgmt_sock, &socket_mask))
