@@ -2400,13 +2400,16 @@ static void readFromIPSocket( n2n_edge_t * eee, SOCKET fd )
             /* Move from pending_peers to known_peers; ignore if not in pending. */
             PEERS_LOCK(eee);
             if ( from_supernode ) {
-                /* REGISTER_ACK relayed via supernode: sender is supernode addr, not peer.
-                 * Use the sock we already have in pending_peers (real peer address). */
+                /* REGISTER_ACK relayed via supernode: direct path NOT verified.
+                 * Do NOT move to known_peers. Keep in pending_peers so traffic uses
+                 * supernode relay. Only promote to known_peers on a direct REGISTER_ACK. */
                 struct peer_info *pscan = find_peer_by_mac(eee->pending_peers, ra.srcMac);
                 if ( pscan )
-                    set_peer_operational( eee, ra.srcMac, &pscan->sock );
+                    pscan->last_seen = n2n_now(); /* keep alive in pending_peers */
+                    traceEvent(TRACE_INFO, "REGISTER_ACK via supernode for %s - direct unverified, staying in pending",
+                               macaddr_str(mac_buf1, ra.srcMac));
             } else {
-                /* Direct REGISTER_ACK: sender is the real peer address. */
+                /* Direct REGISTER_ACK: sender is the real peer address. Direct path confirmed. */
                 set_peer_operational( eee, ra.srcMac, &sender );
             }
             PEERS_UNLOCK(eee);
