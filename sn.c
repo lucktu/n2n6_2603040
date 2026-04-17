@@ -965,7 +965,7 @@ static int process_mgmt( n2n_sn_t * sss,
     ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE,
                       "  id  mac                virt_ip          wan_ip               <KB/s     GB/24h   GB/30d>  ver      os\n");
     ressize += snprintf(resbuf + ressize, N2N_SN_PKTBUF_SIZE - ressize,
-                       "---n2n6----------------------------------------------------------------------------------------------------\n");
+                       "---v2.3----------------------------------------------------------------------------------------------------\n");
 
     r = sendto(sss->mgmt_sock, resbuf, ressize, 0,
                sender_sock, sender_sock_len);
@@ -1144,7 +1144,7 @@ static int process_mgmt( n2n_sn_t * sss,
 
     /* Send footer and statistics */
     ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE,
-                      "----------------------------------------------------------------------------------------------------n2n6---\n");
+                      "----------------------------------------------------------------------------------------------------v2.3---\n");
 
     time_t uptime = now - sss->start_time;
     int days = uptime / 86400;
