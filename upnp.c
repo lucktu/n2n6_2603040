@@ -101,27 +101,60 @@ static int get_default_gateway(struct in_addr *gw_addr)
     return -1;
 
 #else
-    /* macOS / BSD: connect trick - get local IP, assume gateway is x.x.x.1 */
-    int s = socket(AF_INET, SOCK_DGRAM, 0);
-    if (s < 0) return -1;
-    struct sockaddr_in dst;
-    memset(&dst, 0, sizeof(dst));
-    dst.sin_family = AF_INET;
-    inet_pton(AF_INET, "8.8.8.8", &dst.sin_addr);
-    dst.sin_port = htons(53);
-    if (connect(s, (struct sockaddr*)&dst, sizeof(dst)) != 0) {
-        close(s); return -1;
+    /* macOS / BSD: use sysctl to query the routing table for the default gateway.
+     * Falls back to x.x.x.1 heuristic only if sysctl fails. */
+#include <sys/sysctl.h>
+#include <net/route.h>
+#include <net/if_dl.h>
+    {
+        /* Use CTL_NET / PF_ROUTE / 0 / AF_INET / NET_RT_FLAGS / RTF_GATEWAY */
+        int mib[] = { CTL_NET, PF_ROUTE, 0, AF_INET, NET_RT_FLAGS, RTF_GATEWAY };
+        size_t needed = 0;
+        if (sysctl(mib, 6, NULL, &needed, NULL, 0) == 0 && needed > 0) {
+            char *buf = malloc(needed);
+            if (buf && sysctl(mib, 6, buf, &needed, NULL, 0) == 0) {
+                char *end = buf + needed;
+                struct rt_msghdr *rtm;
+                for (char *p = buf; p < end; p += rtm->rtm_msglen) {
+                    rtm = (struct rt_msghdr*)p;
+                    if (!(rtm->rtm_flags & RTF_GATEWAY)) continue;
+                    struct sockaddr *sa = (struct sockaddr*)(rtm + 1);
+                    /* First sockaddr is dst, second is gateway */
+                    /* Skip dst sockaddr (aligned) */
+                    size_t sa_len = sa->sa_len ? ((sa->sa_len + sizeof(long)-1) & ~(sizeof(long)-1)) : sizeof(long);
+                    sa = (struct sockaddr*)((char*)sa + sa_len);
+                    if (sa->sa_family == AF_INET) {
+                        gw_addr->s_addr = ((struct sockaddr_in*)sa)->sin_addr.s_addr;
+                        free(buf);
+                        return 0;
+                    }
+                }
+            }
+            free(buf);
+        }
     }
-    struct sockaddr_in me;
-    socklen_t melen = sizeof(me);
-    if (getsockname(s, (struct sockaddr*)&me, &melen) != 0) {
-        close(s); return -1;
+    /* Fallback: connect trick + x.x.x.1 heuristic */
+    {
+        int s = socket(AF_INET, SOCK_DGRAM, 0);
+        if (s < 0) return -1;
+        struct sockaddr_in dst;
+        memset(&dst, 0, sizeof(dst));
+        dst.sin_family = AF_INET;
+        inet_pton(AF_INET, "8.8.8.8", &dst.sin_addr);
+        dst.sin_port = htons(53);
+        if (connect(s, (struct sockaddr*)&dst, sizeof(dst)) != 0) {
+            close(s); return -1;
+        }
+        struct sockaddr_in me;
+        socklen_t melen = sizeof(me);
+        if (getsockname(s, (struct sockaddr*)&me, &melen) != 0) {
+            close(s); return -1;
+        }
+        close(s);
+        uint32_t local = ntohl(me.sin_addr.s_addr);
+        gw_addr->s_addr = htonl((local & 0xFFFFFF00) | 1);
+        return 0;
     }
-    close(s);
-    /* Assume gateway is x.x.x.1 (works for most home routers) */
-    uint32_t local = ntohl(me.sin_addr.s_addr);
-    gw_addr->s_addr = htonl((local & 0xFFFFFF00) | 1);
-    return 0;
 #endif
 }
 

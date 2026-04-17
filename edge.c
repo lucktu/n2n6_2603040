@@ -225,8 +225,8 @@ static int readConfFile(const char * filename, char * const linebuffer) {
         p = strchr(buffer, '\n');
         if (p) *p ='\0';
 
-        /* Verify buffer validity */
-        if (!buffer || strlen(buffer) == 0) {
+        /* skip empty lines */
+        if (strlen(buffer) == 0) {
             continue;
         }
 
@@ -297,9 +297,11 @@ static int edge_init_speck( n2n_edge_t * eee, uint8_t *encrypt_pwd, uint64_t enc
 
     if (pstat <= 0) {
         /* Hex parsing failed, use ASCII directly */
-        memcpy(spec.opaque + 2, encrypt_pwd, encrypt_pwd_len);
-        spec.opaque[2 + encrypt_pwd_len] = '\0';
-        pstat = encrypt_pwd_len;
+        size_t max_copy = sizeof(spec.opaque) - 2 - 1; /* leave room for '\0' */
+        size_t copy_len = (encrypt_pwd_len <= max_copy) ? encrypt_pwd_len : max_copy;
+        memcpy(spec.opaque + 2, encrypt_pwd, copy_len);
+        spec.opaque[2 + copy_len] = '\0';
+        pstat = (int)copy_len;
     }
 
     /* Add the spec to the Speck transform */
@@ -365,6 +367,18 @@ static char ** buildargv(int * effectiveargc, char * const linebuffer) {
                 }
             }
         } else {
+            if (argc >= maxargc) {
+                maxargc *= 2;
+                char** new_argv = (char **)realloc(argv, maxargc * sizeof(char*));
+                if (new_argv == NULL) {
+                    traceEvent(TRACE_ERROR, "Unable to re-allocate memory");
+                    for (int i = 0; i < argc; i++) free(argv[i]);
+                    free(argv);
+                    free(buffer);
+                    return NULL;
+                }
+                argv = new_argv;
+            }
             argv[argc++] = strdup(buff);
             break;
         }
@@ -654,8 +668,8 @@ static void send_register( n2n_edge_t * eee,
     strncpy(reg.version, n2n_sw_version, sizeof(reg.version) - 1);
     strncpy(reg.os_name, n2n_sw_osName, sizeof(reg.os_name) - 1);
 
-    idx=0;
-    encode_uint32( reg.cookie, &idx, 123456789 );
+    /* Generate a random cookie to match REGISTER with REGISTER_ACK */
+    random_bytes(NULL, reg.cookie, N2N_COOKIE_SIZE);
     idx=0;
     encode_mac( reg.srcMac, &idx, eee->device.mac_addr );
 
@@ -1357,22 +1371,22 @@ void set_peer_operational( n2n_edge_t * eee,
         /* Send REGISTER back to confirm our new address to the peer */
         send_register( eee, &(scan->sock) );
 
-        /* Send unicast gratuitous ARP to the newly established peer so it
-         * updates its ARP table with our MAC, allowing ping immediately. */
+        /* Send unicast gratuitous ARP Reply to the newly established peer so it
+         * updates its ARP table with our MAC immediately (no waiting for ARP request). */
         {
             uint8_t arp[42];
             memset(arp, 0, sizeof(arp));
             memcpy(arp,   scan->mac_addr, 6);              /* dst: peer's MAC */
             memcpy(arp+6, eee->device.mac_addr, 6);        /* src: our MAC */
-            arp[12] = 0x08; arp[13] = 0x06;               /* ARP */
-            arp[14] = 0x00; arp[15] = 0x01;               /* Ethernet */
-            arp[16] = 0x08; arp[17] = 0x00;               /* IPv4 */
-            arp[18] = 6;    arp[19] = 4;
-            arp[20] = 0x00; arp[21] = 0x01;               /* Request */
-            memcpy(arp+22, eee->device.mac_addr, 6);       /* sender MAC */
-            memcpy(arp+28, &eee->device.ip_addr, 4);       /* sender IP */
+            arp[12] = 0x08; arp[13] = 0x06;               /* EtherType: ARP */
+            arp[14] = 0x00; arp[15] = 0x01;               /* HW type: Ethernet */
+            arp[16] = 0x08; arp[17] = 0x00;               /* Protocol: IPv4 */
+            arp[18] = 6;    arp[19] = 4;                  /* HW size, Proto size */
+            arp[20] = 0x00; arp[21] = 0x02;               /* Opcode: Reply (gratuitous) */
+            memcpy(arp+22, eee->device.mac_addr, 6);       /* sender MAC: ours */
+            memcpy(arp+28, &eee->device.ip_addr, 4);       /* sender IP: ours */
             memcpy(arp+32, scan->mac_addr, 6);             /* target MAC: peer */
-            memcpy(arp+38, &eee->device.ip_addr, 4);       /* target IP = our IP */
+            memcpy(arp+38, &eee->device.ip_addr, 4);       /* target IP: ours (gratuitous) */
             tuntap_write(&eee->device, arp, sizeof(arp));
         }
 
@@ -1675,13 +1689,8 @@ static int send_PACKET( n2n_edge_t * eee,
  */
 static size_t edge_choose_tx_transop( const n2n_edge_t * eee )
 {
-    if ( eee->null_transop) {
+    if ( eee->null_transop )
         return N2N_TRANSOP_NULL_IDX;
-    }
-
-    if (eee->tx_transop_idx == N2N_TRANSOP_SPECK_IDX) {
-        return N2N_TRANSOP_SPECK_IDX;
-    }
 
     return eee->tx_transop_idx;
 }
@@ -1711,25 +1720,26 @@ static void send_packet2net(n2n_edge_t * eee,
             /* This is an IP packet from the local source address - not forwarded. */
 #define ETH_FRAMESIZE 14
 #define IP4_SRCOFFSET 12
-            uint32_t *dst = (uint32_t*)&tap_pkt[ETH_FRAMESIZE + IP4_SRCOFFSET];
+            uint32_t dst;
+            memcpy(&dst, &tap_pkt[ETH_FRAMESIZE + IP4_SRCOFFSET], sizeof(dst));
 
             /* Note: all elements of the_ip are in network order */
-            if( *dst != eee->device.ip_addr) {
+            if( dst != eee->device.ip_addr) {
                 /* This is a packet that needs to be routed */
                 traceEvent(TRACE_INFO, "Discarding routed packet [%s]",
-                           inet_ntop(AF_INET, dst, ip_buf, sizeof(ip_buf)));
+                           inet_ntop(AF_INET, &dst, ip_buf, sizeof(ip_buf)));
                 return;
             } else {
                 /* This packet is originated by us */
-                /* traceEvent(TRACE_INFO, "Sending non-routed packet"); */
             }
         } else if(htons(0x86dd) == eh.type) {
             /* IPv6 package */
 #define IP6_SRCOFFSET 8
-            struct in6_addr* dst = (struct in6_addr *)&tap_pkt[ETH_FRAMESIZE + IP6_SRCOFFSET];
-            if( memcmp(dst, &eee->device.ip6_addr, IPV6_SIZE ) != 0 ) {
+            struct in6_addr dst6;
+            memcpy(&dst6, &tap_pkt[ETH_FRAMESIZE + IP6_SRCOFFSET], sizeof(dst6));
+            if( memcmp(&dst6, &eee->device.ip6_addr, IPV6_SIZE ) != 0 ) {
                 traceEvent(TRACE_INFO, "Discarding routed packet [%s]",
-                           inet_ntop(AF_INET6, dst, ip_buf, sizeof(ip_buf)));
+                           inet_ntop(AF_INET6, &dst6, ip_buf, sizeof(ip_buf)));
                 return;
             } else {
 
@@ -2436,10 +2446,11 @@ static void readFromIPSocket( n2n_edge_t * eee, SOCKET fd )
                  * Do NOT move to known_peers. Keep in pending_peers so traffic uses
                  * supernode relay. Only promote to known_peers on a direct REGISTER_ACK. */
                 struct peer_info *pscan = find_peer_by_mac(eee->pending_peers, ra.srcMac);
-                if ( pscan )
+                if ( pscan ) {
                     pscan->last_seen = n2n_now(); /* keep alive in pending_peers */
                     traceEvent(TRACE_INFO, "REGISTER_ACK via supernode for %s - direct unverified, staying in pending",
                                macaddr_str(mac_buf1, ra.srcMac));
+                }
             } else {
                 /* Direct REGISTER_ACK: sender is the real peer address. Direct path confirmed. */
                 set_peer_operational( eee, ra.srcMac, &sender );

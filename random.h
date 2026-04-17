@@ -19,7 +19,11 @@
 #include <bcrypt.h>
 #endif
 
-/* ---------- XORSHIFT128+ state (same as cnn2n) ---------- */
+/* ---------- XORSHIFT128+ state (same as cnn2n) ----------
+ * Note: _n2n_rng is a global, but thread safety is not a concern here:
+ *   - Windows uses BCryptGenRandom in random_bytes_buf, never touches _n2n_rng
+ *   - Linux/BSD edge is single-threaded (no tunReadThread)
+ * If multi-threaded Linux support is added in future, protect with a mutex. */
 typedef struct { uint64_t a, b; } n2n_rng_state_t;
 
 static n2n_rng_state_t _n2n_rng = {

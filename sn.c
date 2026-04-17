@@ -61,7 +61,7 @@ struct community_stats {
     uint64_t recent_seconds[COMM_STATS_SECONDS];
     int      recent_idx;
     time_t   last_second;
-    uint64_t instant_bps;
+    uint64_t instant_Bps;   /* bytes/s: rolling average over COMM_STATS_SECONDS */
 
     /* 24-hour sliding window (1-minute buckets) */
     uint64_t bytes_1440[COMM_STATS_MINUTES];
@@ -101,7 +101,9 @@ struct rate_limit_rule {
     struct rate_limit_rule *next;
 };
 
-/* Find or create community stats entry */
+/* Find or create community stats entry.
+ * If newly created and rules != NULL, applies rate limit rules immediately
+ * so per-packet apply_rules_to_stats() calls are not needed. */
 static struct community_stats * get_community_stats(
         struct community_stats **head,
         const n2n_community_t community,
@@ -148,7 +150,7 @@ static void update_community_traffic(struct community_stats *s, size_t bytes, ti
         s->last_second = now;
         uint64_t total = 0;
         for (int k = 0; k < COMM_STATS_SECONDS; k++) total += s->recent_seconds[k];
-        s->instant_bps = total / COMM_STATS_SECONDS;
+        s->instant_Bps = total / COMM_STATS_SECONDS;
     }
     s->recent_seconds[s->recent_idx] += bytes;
 
@@ -418,7 +420,7 @@ static void load_community_stats(n2n_sn_t *sss)
         uint64_t last_active, total_bytes, last_24h, total_30d;
         int day_idx, min_idx;
         int64_t last_day, last_minute;
-        if (sscanf(line, "%32s %" SCNu64 " %" SCNu64 " %" SCNu64 " %" SCNu64
+        if (sscanf(line, "%16s %" SCNu64 " %" SCNu64 " %" SCNu64 " %" SCNu64
                          " %d %" SCNd64 " %d %" SCNd64,
                    cname, &last_active, &total_bytes, &last_24h, &total_30d,
                    &day_idx, &last_day, &min_idx, &last_minute) != 9)
@@ -664,13 +666,19 @@ static int update_edge( n2n_sn_t * sss,
                 }
                 if (cached_ip != 0) {
                     assigned_ip = cached_ip;
-                    traceEvent(TRACE_INFO, "Reusing IP 10.64.0.%u for edge %s (community %s)",
-                               assigned_ip & 0xFF, macaddr_str(mac_buf, edgeMac), (char*)community);
+                    traceEvent(TRACE_INFO, "Reusing IP %u.%u.%u.%u for edge %s (community %s)",
+                               (assigned_ip>>24)&0xFF, (assigned_ip>>16)&0xFF,
+                               (assigned_ip>>8)&0xFF, assigned_ip&0xFF,
+                               macaddr_str(mac_buf, edgeMac), (char*)community);
                 } else {
                     if (cs) {
                         assigned_ip = cs->next_ip++;
+                        /* Wrap when last octet exceeds 254 (x.x.x.255 is broadcast) */
                         if ((cs->next_ip & 0xFF) > 254)
-                            cs->next_ip = 0x0a400002; /* wrap back to .2 */
+                            cs->next_ip = (cs->next_ip & 0xFFFFFF00) + 2; /* skip .0 and .1 */
+                        /* Wrap entire block back to 10.64.0.2 after 10.64.255.254 */
+                        if (cs->next_ip > 0x0a40FFFE)
+                            cs->next_ip = 0x0a400002;
                         /* Store in community's MAC->IP map */
                         struct mac_ip_entry *ne = calloc(1, sizeof(struct mac_ip_entry));
                         if (ne) {
@@ -683,8 +691,10 @@ static int update_edge( n2n_sn_t * sss,
                         /* Fallback: should not happen, but be safe */
                         assigned_ip = 0x0a400002;
                     }
-                    traceEvent(TRACE_INFO, "Auto-assigning IP 10.64.0.%u to edge %s (community %s)",
-                               assigned_ip & 0xFF, macaddr_str(mac_buf, edgeMac), (char*)community);
+                    traceEvent(TRACE_INFO, "Auto-assigning IP %u.%u.%u.%u to edge %s (community %s)",
+                               (assigned_ip>>24)&0xFF, (assigned_ip>>16)&0xFF,
+                               (assigned_ip>>8)&0xFF, assigned_ip&0xFF,
+                               macaddr_str(mac_buf, edgeMac), (char*)community);
                 }
             }
             scan->assigned_ip = assigned_ip;
@@ -869,7 +879,9 @@ static int try_forward( n2n_sn_t * sss,
         struct community_stats *cs = get_community_stats(&sss->comm_stats,
                                                           cmn->community, now);
         if (cs) {
-            apply_rules_to_stats(cs, sss->rate_rules);
+            /* Apply rules on first use (new entry has zeroed limits) */
+            if (cs->rate_limit_bps == 0 && cs->max_24h_bytes == 0)
+                apply_rules_to_stats(cs, sss->rate_rules);
             if (!check_rate_limit(cs, pktsize, now)) {
                 traceEvent(TRACE_DEBUG, "rate limit drop for community %s", cmn->community);
                 return 0;
@@ -941,8 +953,9 @@ static int process_mgmt( n2n_sn_t * sss,
     size_t ressize = 0;
     ssize_t r;
     struct peer_info *list;
-    n2n_community_t communities[256];
-    struct peer_info *community_edges[256];
+#define MAX_COMMUNITIES 256
+    n2n_community_t communities[MAX_COMMUNITIES];
+    struct peer_info *community_edges[MAX_COMMUNITIES];
     int num_communities = 0;
     uint32_t num_edges = 0;
 
@@ -958,61 +971,30 @@ static int process_mgmt( n2n_sn_t * sss,
                sender_sock, sender_sock_len);
     if (r <= 0) return -1;
 
-    /* First pass: collect all unique communities and their edges */
+    /* First pass: collect unique community names (no malloc, pointer only) */
     list = sss->edges;
     while (list) {
-        /* Check if this community already exists */
         int found = 0;
         for (int i = 0; i < num_communities; i++) {
             if (memcmp(communities[i], list->community_name, sizeof(n2n_community_t)) == 0) {
-                /* Add edge to existing community */
-                struct peer_info *new_edge = malloc(sizeof(struct peer_info));
-                if (!new_edge) {
-                    for (int j = 0; j < num_communities; j++) {
-                        struct peer_info *temp = community_edges[j];
-                        while (temp) {
-                            struct peer_info *next = temp->next;
-                            free(temp);
-                            temp = next;
-                        }
-                    }
-                    traceEvent(TRACE_ERROR, "malloc failed for new_edge in process_mgmt");
-                    return -1;
-                }
-                memcpy(new_edge, list, sizeof(struct peer_info));
-                new_edge->next = community_edges[i];
-                community_edges[i] = new_edge;
                 found = 1;
                 break;
             }
         }
-
-        if (!found && num_communities < 256) {
-            /* New community */
+        if (!found && num_communities < MAX_COMMUNITIES) {
             memcpy(communities[num_communities], list->community_name, sizeof(n2n_community_t));
-            community_edges[num_communities] = malloc(sizeof(struct peer_info));
-            if (!community_edges[num_communities]) {
-                for (int j = 0; j < num_communities; j++) {
-                    struct peer_info *temp = community_edges[j];
-                    while (temp) {
-                        struct peer_info *next = temp->next;
-                        free(temp);
-                        temp = next;
-                    }
-                }
-                traceEvent(TRACE_ERROR, "malloc failed for community_edges[%d] in process_mgmt", num_communities);
-                return -1;
-            }
-            memcpy(community_edges[num_communities], list, sizeof(struct peer_info));
-            community_edges[num_communities]->next = NULL;
+            community_edges[num_communities] = NULL; /* unused now */
             num_communities++;
+        } else if (!found) {
+            traceEvent(TRACE_WARNING,
+                       "process_mgmt: community limit (%d) reached, some communities not displayed",
+                       MAX_COMMUNITIES);
         }
-
         num_edges++;
         list = list->next;
     }
 
-    /* Second pass: display edges grouped by community */
+    /* Second pass: for each community, scan edges list directly - no malloc needed */
     uint32_t displayed_edges = 0;
     for (int i = 0; i < num_communities; i++) {
         /* Community name line with traffic stats on same line */
@@ -1021,10 +1003,10 @@ static int process_mgmt( n2n_sn_t * sss,
             while (cs && memcmp(cs->community_name, communities[i], sizeof(n2n_community_t)) != 0)
                 cs = cs->next;
             if (cs && cs->total_30d > 0) {
-                double kbps   = cs->instant_bps / 1024.0;
+                double kbps   = cs->instant_Bps / 1024.0;
                 double gb_24h = cs->last_24h_bytes / (1024.0*1024.0*1024.0);
                 double gb_30d = cs->total_30d / (1024.0*1024.0*1024.0);
-                const char *arrow = (cs->instant_bps > 0) ? "--->" : "    ";
+                const char *arrow = (cs->instant_Bps > 0) ? "--->" : "    ";
                 ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE,
                                    "%-57s  %s %-7.1f  %-7.1f  %-10.1f\n",
                                    communities[i], arrow, kbps, gb_24h, gb_30d);
@@ -1034,45 +1016,36 @@ static int process_mgmt( n2n_sn_t * sss,
         } else {
             ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE, "%s\n", communities[i]);
         }
-        r = sendto(sss->mgmt_sock, resbuf, ressize, 0,
-                  sender_sock, sender_sock_len);
+        r = sendto(sss->mgmt_sock, resbuf, ressize, 0, sender_sock, sender_sock_len);
         if (r <= 0) return -1;
 
-        /* Send all edges in this community */
-        struct peer_info *edge = community_edges[i];
+        /* Output all edges belonging to this community directly from the original list */
+        struct peer_info *edge = sss->edges;
         int id = 1;
         while (edge) {
+            if (memcmp(edge->community_name, communities[i], sizeof(n2n_community_t)) != 0) {
+                edge = edge->next;
+                continue;
+            }
+
             macstr_t mac_buf;
             n2n_sock_str_t sock_buf;
             const char *version = (edge->version[0] != '\0') ? edge->version : "unknown";
             const char *os_name = (edge->os_name[0] != '\0') ? edge->os_name : "unknown";
 
-            /* MAC address validation */
             uint8_t *mac = edge->mac_addr;
             int is_valid_mac = 1;
-
-            /* Check for zero MAC */
             if (mac[0] == 0 && mac[1] == 0 && mac[2] == 0 &&
-                mac[3] == 0 && mac[4] == 0 && mac[5] == 0) {
+                mac[3] == 0 && mac[4] == 0 && mac[5] == 0)
                 is_valid_mac = 0;
-            }
-
-            /* Check for broadcast MAC */
             if (mac[0] == 0xFF && mac[1] == 0xFF && mac[2] == 0xFF &&
-                mac[3] == 0xFF && mac[4] == 0xFF && mac[5] == 0xFF) {
+                mac[3] == 0xFF && mac[4] == 0xFF && mac[5] == 0xFF)
                 is_valid_mac = 0;
-            }
-
-            /* Check for locally administered MAC (00:01:00:xx:xx:xx pattern) */
-            if (mac[0] == 0x00 && mac[1] == 0x01 && mac[2] == 0x00) {
+            if (mac[0] == 0x00 && mac[1] == 0x01 && mac[2] == 0x00)
                 is_valid_mac = 0;
-            }
 
-            /* Skip invalid MAC addresses - don't display them at all */
             if (!is_valid_mac) {
-                struct peer_info *temp = edge;
                 edge = edge->next;
-                free(temp);
                 continue;
             }
 
@@ -1086,20 +1059,17 @@ static int process_mgmt( n2n_sn_t * sss,
 
             ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE,
                                "  %2u  %-17s  %-15s  %-47s  %-7s  %s\n",
-                              id++,
-                              macaddr_str(mac_buf, edge->mac_addr),
-                              virt_ip,
-                              sock_to_cstr(sock_buf, &edge->sock),
-                              version,
-                              os_name);
+                               id++,
+                               macaddr_str(mac_buf, edge->mac_addr),
+                               virt_ip,
+                               sock_to_cstr(sock_buf, &edge->sock),
+                               version,
+                               os_name);
 
-            r = sendto(sss->mgmt_sock, resbuf, ressize, 0,
-                      sender_sock, sender_sock_len);
+            r = sendto(sss->mgmt_sock, resbuf, ressize, 0, sender_sock, sender_sock_len);
             if (r <= 0) return -1;
 
-            struct peer_info *temp = edge;
             edge = edge->next;
-            free(temp);
         }
     }
 
@@ -1122,10 +1092,10 @@ static int process_mgmt( n2n_sn_t * sss,
                 if (idle < 86400) {
                     /* Offline < 24h: show individually */
                     if (cs->total_30d > 0) {
-                        double kbps  = cs->instant_bps / 1024.0;
+                        double kbps  = cs->instant_Bps / 1024.0;
                         double gb24h = cs->last_24h_bytes / (1024.0*1024.0*1024.0);
                         double gb30d = cs->total_30d / (1024.0*1024.0*1024.0);
-                        const char *arrow = (cs->instant_bps > 0) ? "--->" : "    ";
+                        const char *arrow = (cs->instant_Bps > 0) ? "--->" : "    ";
                         ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE,
                                            "%-57s  %s %-7.1f  %-7.1f  %-10.1f\n",
                                            cs->community_name, arrow, kbps, gb24h, gb30d);
@@ -1137,7 +1107,7 @@ static int process_mgmt( n2n_sn_t * sss,
                     if (r <= 0) return -1;
                 } else {
                     /* Offline >= 24h: fold into summary */
-                    off_kbps += cs->instant_bps / 1024.0;
+                    off_kbps += cs->instant_Bps / 1024.0;
                     off_24h  += cs->last_24h_bytes / (1024.0*1024.0*1024.0);
                     off_30d  += cs->total_30d / (1024.0*1024.0*1024.0);
                 }
@@ -1157,7 +1127,7 @@ static int process_mgmt( n2n_sn_t * sss,
         double total_kbps = 0.0, total_24h = 0.0, total_30d = 0.0;
         struct community_stats *cs = sss->comm_stats;
         while (cs) {
-            total_kbps += cs->instant_bps / 1024.0;
+            total_kbps += cs->instant_Bps / 1024.0;
             total_24h  += cs->last_24h_bytes / (1024.0*1024.0*1024.0);
             total_30d  += cs->total_30d / (1024.0*1024.0*1024.0);
             cs = cs->next;
@@ -1237,7 +1207,8 @@ static int try_broadcast( n2n_sn_t * sss,
         struct community_stats *cs = get_community_stats(&sss->comm_stats,
                                                           cmn->community, now);
         if (cs) {
-            apply_rules_to_stats(cs, sss->rate_rules);
+            if (cs->rate_limit_bps == 0 && cs->max_24h_bytes == 0)
+                apply_rules_to_stats(cs, sss->rate_rules);
             if (!check_rate_limit(cs, pktsize, now)) {
                 traceEvent(TRACE_DEBUG, "rate limit drop broadcast for community %s",
                            cmn->community);

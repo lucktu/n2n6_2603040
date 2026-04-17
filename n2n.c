@@ -59,10 +59,18 @@ SOCKET open_socket(uint16_t local_port, int bind_any) {
     local_address.sin_addr.s_addr = htonl(bind_any?INADDR_ANY:INADDR_LOOPBACK);
 
     if(bind(sock_fd, (struct sockaddr*) &local_address, sizeof(local_address)) == -1) {
+#ifdef _WIN32
+        int err = WSAGetLastError();
+        if(err == WSAEADDRINUSE)
+            traceEvent(TRACE_DEBUG, "Bind error [%d]\n", err);
+        else
+            traceEvent(TRACE_ERROR, "Bind error [%d]\n", err);
+#else
         if(errno == EADDRINUSE)
             traceEvent(TRACE_DEBUG, "Bind error [%s]\n", strerror(errno));
         else
             traceEvent(TRACE_ERROR, "Bind error [%s]\n", strerror(errno));
+#endif
         closesocket(sock_fd);
         return -1;
     }
@@ -129,7 +137,7 @@ SOCKET open_socket_unix(const char* path, mode_t access) {
 
     memset(&socket_address, 0, sizeof(socket_address));
     socket_address.sun_family = AF_UNIX;
-    strncpy(socket_address.sun_path, path, 108);
+    strncpy(socket_address.sun_path, path, sizeof(socket_address.sun_path) - 1);
 
 #if __linux__
     fchmod(sock_fd, access);
@@ -154,7 +162,7 @@ bool useSyslog = false, syslog_opened = false, useSystemd = false;
  * This ensures all timeout logic works correctly on systems without NTP. */
 time_t n2n_now(void) {
     time_t now = time(NULL);
-    if (now >= 1000) return now; /* clock is fine */
+    if (now >= 946684800) return now; /* clock is fine (>= 2000-01-01) */
 
     /* Clock not set: use POSIX clock_gettime for monotonic time if available,
      * otherwise fall back to clock() which is always monotonic. */

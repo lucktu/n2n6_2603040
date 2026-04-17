@@ -81,7 +81,6 @@ static int set_mac(int fd, const char* dev, n2n_mac_t device_mac) {
 
 static int netlink_talk(int nl_sock, struct rtnl_req* req) {
     uint8_t buf[1024] = { 0 };
-    ssize_t rtn = -1;
 
     struct iovec iov = {
         .iov_base = req,
@@ -117,11 +116,11 @@ static int netlink_talk(int nl_sock, struct rtnl_req* req) {
             return -((struct nlmsgerr*) NLMSG_DATA(nlp))->error;
         } else {
             traceEvent(TRACE_DEBUG, "netlink recv() unexpected msg type: %d\n", nlp->nlmsg_type);
-            return -1;
+            return 0;
         }
-        rtn = 0;
     }
-    return rtn;
+    traceEvent(TRACE_ERROR, "netlink recv() failed [%s]\n", strerror(errno));
+    return -1;
 }
 
 static int set_device_state(const tuntap_dev* device, bool up) {
@@ -256,7 +255,7 @@ int set_ipaddress(const tuntap_dev* device, int static_address) {
     }
 
     if (set_device_state(device, true) != 0) {
-        traceEvent(TRACE_ERROR, "netlink device up: [%s]", strerror(error));
+        traceEvent(TRACE_ERROR, "netlink device up: [%s]", strerror(errno));
         return -1;
     }
 
@@ -471,7 +470,7 @@ void tuntap_get_address(struct tuntap_dev *tuntap) {
     memset(&ifr, 0, sizeof(ifr));
     _sock = socket(PF_INET, SOCK_DGRAM, 0);
 
-    strcpy(ifr.ifr_name, tuntap->dev_name);
+    strncpy(ifr.ifr_name, tuntap->dev_name, IFNAMSIZ - 1);
     ifr.ifr_addr.sa_family = AF_INET;
 
     res = ioctl(_sock, SIOCGIFADDR, &ifr);
