@@ -1344,6 +1344,15 @@ static void check_keepalive( n2n_edge_t * eee, time_t now )
         struct peer_info *next = scan->next;
         time_t idle = now - scan->last_seen;
 
+        /* Skip keepalive for peers using relay (punch_failed=1).
+         * They communicate via supernode, so we don't send direct PROBEs.
+         * Their liveness is tracked through supernode relay activity. */
+        if ( scan->punch_failed ) {
+            prev = scan;
+            scan = next;
+            continue;
+        }
+
         /* Skip keepalive for IPv4-only peers if we have no IPv4 socket (shouldn't happen) */
         if ( scan->sock.family == AF_INET && eee->udp_sock == -1 ) {
             prev = scan;
@@ -1742,14 +1751,15 @@ static void update_peer_address(n2n_edge_t * eee,
                         sock_to_cstr(sockbuf1, &(scan->sock)),
                         sock_to_cstr(sockbuf2, peer) );
             scan->sock = *peer;
-            scan->last_seen = when;
         }
         /* else: ignore supernode's view, it may see a different socket */
     }
     else
     {
-        scan->last_seen = when;
+        scan->sock = *peer;
     }
+    /* Always update last_seen for both direct and relayed packets */
+    scan->last_seen = when;
 }
 
 /** @brief Check to see if we should re-register with the supernode.
