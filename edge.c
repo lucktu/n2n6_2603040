@@ -35,6 +35,8 @@
 
 #ifdef _WIN32
 #include <iphlpapi.h>
+#include <windns.h>
+#pragma comment(lib, "dnsapi.lib")
 /* Interface types for filtering virtual interfaces */
 #ifndef IF_TYPE_PPP
 #define IF_TYPE_PPP 23
@@ -42,6 +44,8 @@
 #ifndef IF_TYPE_TUNNEL
 #define IF_TYPE_TUNNEL 131
 #endif
+#else
+#include <resolv.h>
 #endif
 
 /* reallocarray compatibility for older glibc versions */
@@ -609,7 +613,9 @@ static void help() {
     printf("\n");
     printf("                         : B5 = Speck(-k). '-B1' can also be used as '-B 1' (default: twofish)\n");
     printf("-k <encrypt key>         | Encryption key (ASCII, max 32) - also N2N_KEY=<encrypt key>.\n");
-    printf("-l <supernode host:port> | Supernode IP:port (default: ouno.eu.org:10084)\n");
+    printf("-l <supernode host:port> | Supernode address Formats (default: ouno.eu.org:10084):\n");
+    printf("                         : host:port  - Direct address (e.g. ouno.eu.org:10084)\n");
+    printf("                         : host       - Query DNS TXT record for address (e.g. n2n.example.com)\n");
     printf("-4/-6                    | Resolve supernode DNS name as IPv4 or IPv6 (default: auto)\n");
     printf("-p <local port>          | Fixed local UDP port.\n");
 #ifndef _WIN32
@@ -3059,6 +3065,189 @@ static void startTunReadThread(n2n_edge_t *eee)
 
 /* ***************************************************** */
 
+/** Build DNS query packet for TXT record.
+ *  Returns the length of the query packet.
+ */
+static int build_dns_txt_query(const char *domain, uint8_t *buf, size_t buf_size, uint16_t txn_id) {
+    if (!domain || !buf || buf_size < 256)
+        return -1;
+
+    /* DNS header: 12 bytes */
+    buf[0] = (txn_id >> 8) & 0xFF;  /* Transaction ID high */
+    buf[1] = txn_id & 0xFF;         /* Transaction ID low */
+    buf[2] = 0x01;  /* Flags: Recursion Desired */
+    buf[3] = 0x00;
+    buf[4] = 0x00; buf[5] = 0x01;  /* Questions: 1 */
+    buf[6] = 0x00; buf[7] = 0x00;  /* Answer RRs: 0 */
+    buf[8] = 0x00; buf[9] = 0x00;  /* Authority RRs: 0 */
+    buf[10] = 0x00; buf[11] = 0x00; /* Additional RRs: 0 */
+
+    /* Build domain name in DNS format (length-prefixed labels) */
+    size_t pos = 12;
+    const char *p = domain;
+    while (*p && pos < buf_size - 20) {
+        const char *dot = strchr(p, '.');
+        size_t label_len = dot ? (size_t)(dot - p) : strlen(p);
+        if (label_len > 63 || label_len == 0) return -1;
+        buf[pos++] = (uint8_t)label_len;
+        memcpy(buf + pos, p, label_len);
+        pos += label_len;
+        p = dot ? dot + 1 : p + label_len;
+        if (!dot) break;
+    }
+    buf[pos++] = 0x00;  /* End of domain name */
+
+    /* Query type: TXT (16) */
+    buf[pos++] = 0x00; buf[pos++] = 0x10;
+    /* Query class: IN (1) */
+    buf[pos++] = 0x00; buf[pos++] = 0x01;
+
+    return (int)pos;
+}
+
+/** Parse DNS response for TXT record.
+ *  Returns 0 on success, -1 on failure.
+ */
+static int parse_dns_txt_response(const uint8_t *buf, size_t buf_len, uint16_t txn_id,
+                                   char *txt_result, size_t result_size) {
+    if (!buf || buf_len < 12 || !txt_result)
+        return -1;
+
+    /* Check transaction ID */
+    if (buf[0] != ((txn_id >> 8) & 0xFF) || buf[1] != (txn_id & 0xFF))
+        return -1;
+
+    /* Check flags: must be a response (QR=1) and no error (RCODE=0) */
+    if (!(buf[2] & 0x80)) return -1;  /* Not a response */
+    if (buf[3] & 0x0F) return -1;      /* Error in response */
+
+    /* Get answer count */
+    uint16_t ancount = (buf[6] << 8) | buf[7];
+    if (ancount == 0) return -1;
+
+    /* Skip header (12 bytes) and question section */
+    size_t pos = 12;
+    /* Skip question name */
+    while (pos < buf_len && buf[pos] != 0) {
+        if (buf[pos] & 0xC0) { pos += 2; break; }  /* Compression pointer */
+        pos += buf[pos] + 1;
+    }
+    if (pos < buf_len && buf[pos] == 0) pos++;
+    pos += 4;  /* Skip QTYPE and QCLASS */
+
+    /* Parse answers */
+    for (uint16_t i = 0; i < ancount && pos < buf_len; i++) {
+        /* Skip name (may be compressed) */
+        if (buf[pos] & 0xC0) {
+            pos += 2;
+        } else {
+            while (pos < buf_len && buf[pos] != 0) {
+                pos += buf[pos] + 1;
+            }
+            if (pos < buf_len) pos++;
+        }
+
+        if (pos + 10 > buf_len) return -1;
+
+        uint16_t rtype = (buf[pos] << 8) | buf[pos+1];
+        uint16_t rdlength = (buf[pos+8] << 8) | buf[pos+9];
+        pos += 10;  /* Skip TYPE, CLASS, TTL, RDLENGTH */
+
+        if (rtype == 0x10) {  /* TXT record */
+            if (pos + rdlength > buf_len) return -1;
+            /* TXT RDATA: first byte is length of the text string */
+            uint8_t txt_len = buf[pos];
+            if (txt_len > 0 && txt_len < rdlength && txt_len < result_size) {
+                memcpy(txt_result, buf + pos + 1, txt_len);
+                txt_result[txt_len] = '\0';
+                return 0;
+            }
+        }
+        pos += rdlength;
+    }
+
+    return -1;
+}
+
+/** Query DNS TXT record for supernode address using raw UDP.
+ *  Returns 0 on success, -1 on failure.
+ *  On success, txt_result contains the supernode address (host:port format).
+ */
+static int query_txt_record(const char *domain, char *txt_result, size_t result_size) {
+    if (!domain || !txt_result || result_size == 0)
+        return -1;
+
+    traceEvent(TRACE_NORMAL, "Querying TXT record for %s", domain);
+
+    /* Public DNS servers to try */
+    const char *dns_servers[] = {"8.8.8.8", "119.29.29.29", "1.1.1.1", "223.5.5.5"};
+    uint8_t query_buf[256];
+    uint8_t response_buf[1024];
+    uint16_t txn_id = (uint16_t)(time(NULL) & 0xFFFF);
+
+    /* Build DNS query packet */
+    int query_len = build_dns_txt_query(domain, query_buf, sizeof(query_buf), txn_id);
+    if (query_len < 0) {
+        traceEvent(TRACE_WARNING, "Failed to build DNS query for %s", domain);
+        return -1;
+    }
+
+    /* Try each DNS server */
+    for (int i = 0; i < 4; i++) {
+        struct sockaddr_in dns_addr;
+        memset(&dns_addr, 0, sizeof(dns_addr));
+        dns_addr.sin_family = AF_INET;
+        dns_addr.sin_port = htons(53);
+        
+#ifdef _WIN32
+        dns_addr.sin_addr.s_addr = inet_addr(dns_servers[i]);
+#else
+        inet_pton(AF_INET, dns_servers[i], &dns_addr.sin_addr);
+#endif
+
+        /* Create UDP socket */
+        SOCKET sock = socket(AF_INET, SOCK_DGRAM, 0);
+        if (sock < 0) continue;
+
+        /* Set socket timeout */
+#ifdef _WIN32
+        DWORD timeout = 5000;  /* 5 seconds */
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
+#else
+        struct timeval tv;
+        tv.tv_sec = 5;
+        tv.tv_usec = 0;
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+
+        /* Send DNS query */
+        if (sendto(sock, (char*)query_buf, query_len, 0,
+                   (struct sockaddr*)&dns_addr, sizeof(dns_addr)) < 0) {
+            closesocket(sock);
+            continue;
+        }
+
+        /* Receive DNS response */
+        socklen_t addr_len = sizeof(dns_addr);
+        int resp_len = recvfrom(sock, (char*)response_buf, sizeof(response_buf), 0,
+                                 (struct sockaddr*)&dns_addr, &addr_len);
+        closesocket(sock);
+
+        if (resp_len > 0) {
+            /* Parse DNS response */
+            if (parse_dns_txt_response(response_buf, resp_len, txn_id, txt_result, result_size) == 0) {
+                traceEvent(TRACE_NORMAL, "TXT record found: %s", txt_result);
+                return 0;
+            }
+        }
+    }
+
+    traceEvent(TRACE_WARNING, "No valid TXT record found for %s", domain);
+    return -1;
+}
+
+/* ***************************************************** */
+
 /** Resolve the supernode IP address.
  *
  *  REVISIT: This is a really bad idea. The edge will block completely while the
@@ -3070,7 +3259,7 @@ static int supernode2addr(n2n_sock_t * sn, int af, const n2n_sn_name_t addrIn) {
     int err;
 
     memcpy( addr, addrIn, N2N_EDGE_SN_HOST_SIZE );
-    addr[N2N_EDGE_SN_HOST_SIZE - 1] = '\0'; /* ensure null-terminated */
+    addr[N2N_EDGE_SN_HOST_SIZE - 1] = '\0';
     len = strlen(addr);
 
     if ( len > 0) {
@@ -3082,8 +3271,18 @@ static int supernode2addr(n2n_sock_t * sn, int af, const n2n_sn_name_t addrIn) {
             if ( supernode_port ) {
                 sn->port = atoi(supernode_port + 1);
                 *(supernode_port) = '\0';
-            } else
-                sn->port = SUPERNODE_PORT;
+            } else {
+                /* No port: query TXT record for supernode address */
+                query_txt_record(addr, addr, N2N_EDGE_SN_HOST_SIZE);
+                len = strlen(addr);
+                supernode_port = strrchr(addr, ':');
+                if (supernode_port) {
+                    sn->port = atoi(supernode_port + 1);
+                    *supernode_port = '\0';
+                } else {
+                    sn->port = SUPERNODE_PORT;
+                }
+            }
         }
         if (sn->port == 0)
             sn->port = SUPERNODE_PORT;
@@ -3749,14 +3948,17 @@ if (argc > 1 && argv[1][0] != '-' && access(argv[1], R_OK) == 0) {
         }
     }
 
-    /* Check if supernode address is a domain name, enable periodic re-resolution */
+    /* Check if supernode address is a domain name (or TXT domain), enable periodic re-resolution */
     {
         char *supernode_host = eee.sn_ip_array[eee.sn_idx];
         struct in_addr ipv4_addr;
         struct in6_addr ipv6_addr;
+        /* Check if it's not a raw IP address */
         if (inet_pton(AF_INET, supernode_host, &ipv4_addr) != 1 &&
             inet_pton(AF_INET6, supernode_host, &ipv6_addr) != 1)
         {
+            /* It's a domain name - could be regular domain or TXT domain */
+            /* TXT domain has no port, regular domain has port */
             eee.re_resolve_supernode_ip = 1;
             traceEvent(TRACE_INFO, "Supernode '%s' is a domain name, enabling periodic resolution", supernode_host);
         }
